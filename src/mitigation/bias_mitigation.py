@@ -1,99 +1,179 @@
 import pandas as pd
 import numpy as np
 from sklearn.utils import resample
-from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from imblearn.over_sampling import ADASYN
+
 
 class BiasMitigator:
     def __init__(self, dataset):
         self.dataset = dataset
         
+    def apply_reweighting(self):
+        sensitive_attrs = self._identify_sensitive_attributes()
+        weighted_data = self.dataset.copy()
+        n_rows = len(weighted_data)
+        
+        if 'weight' in weighted_data.columns:
+            weighted_data = weighted_data.drop(columns=['weight'])
+        
+        if not sensitive_attrs:
+            weighted_data['weight'] = 1.0
+            print("No sensitive attributes provided. Assigned uniform weights.")
+        else:
+            weighted_data['temp_group'] = weighted_data[sensitive_attrs].agg('-'.join, axis=1)
+            group_counts = weighted_data['temp_group'].value_counts()
+            group_freqs = group_counts / n_rows
+            weights = 1 / group_freqs
+            weights = weights * n_rows / weights.sum()
+            weighted_data['weight'] = weighted_data['temp_group'].map(weights)
+            weighted_data = weighted_data.drop(columns=['temp_group'])
+        
+        total_weight = weighted_data['weight'].sum()
+        print("Reweighting applied:")
+        print(f"Total sum of weights: {total_weight:.2f}")
+        if abs(total_weight - n_rows) > 1e-6:
+            print(f"Error: Weight sum does not match expected value! Expected: {n_rows}, Got: {total_weight}")
+            raise ValueError("Weight calculation failed!")
+        
+        for attr in sensitive_attrs:
+            print(f"\nBalance for {attr}:")
+            attr_sums = weighted_data.groupby(attr)['weight'].sum()
+            print("Actual sums:")
+            print(attr_sums)
+            print("Normalized:")
+            print(attr_sums / attr_sums.sum())
+        
+        return weighted_data
+    
     def apply_resampling(self):
         """Apply resampling technique to balance the dataset"""
         sensitive_attrs = self._identify_sensitive_attributes()
         balanced_data = self.dataset.copy()
-        
-        for attr in sensitive_attrs:
-            # Get the size of the largest group
-            group_sizes = balanced_data[attr].value_counts()
-            max_size = group_sizes.max()
+        original_size = len(balanced_data)
+
+        # Create a combined group identifier based on all sensitive attributes
+        if sensitive_attrs:
+            # Create a temporary column with combined group values
+            balanced_data['temp_group'] = balanced_data[sensitive_attrs].agg('-'.join, axis=1)
             
-            # Resample each group to match the largest group
-            resampled_groups = []
-            for group_val in group_sizes.index:
-                group_data = balanced_data[balanced_data[attr] == group_val]
-                if len(group_data) < max_size:
-                    resampled_group = resample(
-                        group_data,
-                        replace=True,
-                        n_samples=max_size,
-                        random_state=42
-                    )
-                    resampled_groups.append(resampled_group)
-                else:
-                    resampled_groups.append(group_data)
+            # Get group sizes
+            group_sizes = balanced_data['temp_group'].value_counts()
+            n_groups = len(group_sizes)
             
-            balanced_data = pd.concat(resampled_groups)
-        
+            # Set target size: aim to keep total size close to original, but at least 100 per group
+            target_size = max(100, min(group_sizes.max(), original_size // n_groups))
+            # Add absolute maximum cap at original size
+            target_size = min(target_size, original_size // max(1, n_groups // 2))
+            
+            # Skip resampling if all groups are already roughly balanced
+            if group_sizes.max() - group_sizes.min() < target_size * 0.1:  # Allow 10% variance
+                print("Dataset is already sufficiently balanced. Skipping resampling.")
+                balanced_data = balanced_data.drop('temp_group', axis=1)
+            else:
+                # Resample groups to match target size
+                resampled_groups = []
+                for group_val in group_sizes.index:
+                    group_data = balanced_data[balanced_data['temp_group'] == group_val]
+                    
+                    if len(group_data) < target_size:
+                        resampled_group = resample(
+                            group_data,
+                            replace=True,
+                            n_samples=target_size,
+                            random_state=42
+                        )
+                        resampled_groups.append(resampled_group)
+                    elif len(group_data) > target_size:
+                        # Downsample large groups
+                        resampled_group = resample(
+                            group_data,
+                            replace=False,
+                            n_samples=target_size,
+                            random_state=42
+                        )
+                        resampled_groups.append(resampled_group)
+                    else:
+                        resampled_groups.append(group_data)
+
+                # Combine resampled groups and remove temporary column
+                balanced_data = pd.concat(resampled_groups, ignore_index=True)
+                balanced_data = balanced_data.drop('temp_group', axis=1)
+
         print("Resampling applied:")
-        print(balanced_data[sensitive_attrs].value_counts())
+        print(balanced_data[sensitive_attrs].nunique())  # Check unique values per sensitive attribute
+        print("Final dataset shape:", balanced_data.shape)
+        print("Group sizes before resampling:\n", group_sizes)
+        print("Target group size:", target_size)
+        print("New dataset shape after resampling:", balanced_data.shape)
+
         return balanced_data
     
-    def apply_reweighting(self):
-        """Apply reweighting technique to balance the dataset"""
-        sensitive_attrs = self._identify_sensitive_attributes()
-        weighted_data = self.dataset.copy()
-        
-        for attr in sensitive_attrs:
-            # Calculate group frequencies
-            group_freqs = weighted_data[attr].value_counts(normalize=True)
-            
-            # Calculate weights (inverse of frequency)
-            weights = 1 / group_freqs
-            
-            # Normalize weights
-            weights = weights / weights.sum()
-            
-            # Apply weights to each group
-            weighted_data['weight'] = weighted_data[attr].map(weights)
-        
-        # Duplicate rows based on weights
-        weighted_data = weighted_data.loc[weighted_data.index.repeat(weighted_data['weight'].round().astype(int))]
-        weighted_data = weighted_data.drop(columns=['weight'])
-        
-        print("Reweighting applied:")
-        print(weighted_data[sensitive_attrs].value_counts())
-        return weighted_data
     
-    def generate_synthetic_data(self):
-        """Generate synthetic data using SMOTE"""
+
+    def generate_synthetic_data(self, random_state=50):
+        """Generate synthetic data using ADASYN with a controlled sampling strategy."""
+
         sensitive_attrs = self._identify_sensitive_attributes()
         target = self._identify_target_variable()
-        
+
         if target is None:
             return self.dataset.copy()
-            
-        # Prepare data for SMOTE
+
+        # Prepare data
         X = self.dataset.drop(columns=[target])
         y = self.dataset[target]
-        
-        # Convert categorical variables to numeric
-        X_encoded = pd.get_dummies(X)
-        
-        # Apply SMOTE
-        smote = SMOTE(random_state=42)
-        X_synthetic, y_synthetic = smote.fit_resample(X_encoded, y)
-        
-        # Convert back to original format
-        synthetic_data = self._reconstruct_categorical_data(
-            X_synthetic,
-            X_encoded.columns,
-            sensitive_attrs
-        )
-        synthetic_data[target] = y_synthetic
-        
+
+        # Identify categorical columns
+        categorical_columns = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+        if categorical_columns:
+            encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+            X_encoded = encoder.fit_transform(X[categorical_columns])
+            X_encoded_df = pd.DataFrame(X_encoded, columns=encoder.get_feature_names_out(categorical_columns))
+
+            # Drop original categorical columns and merge with encoded data
+            X_numeric = X.drop(columns=categorical_columns).reset_index(drop=True)
+            X_final = pd.concat([X_numeric, X_encoded_df], axis=1)
+        else:
+            X_final = X.reset_index(drop=True)
+
+        # Normalize numerical features
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X_final)
+
+        # Print class distribution before applying ADASYN
+        print("Class distribution before ADASYN:")
+        print(y.value_counts())
+
+        # Dynamically adjust n_neighbors based on dataset size
+        min_class_size = min(y.value_counts())
+        n_neighbors = min(3, max(1, min_class_size - 1))  # Ensure n_neighbors is valid
+
+        # Apply ADASYN only if class imbalance exists
+        if len(y.value_counts()) > 1:
+            adasyn = ADASYN(sampling_strategy="minority", random_state=random_state, n_neighbors=n_neighbors)
+            X_resampled, y_resampled = adasyn.fit_resample(X_scaled, y)
+        else:
+            print("Dataset is already balanced. Returning original dataset.")
+            return self.dataset
+
+        # Convert synthetic data back to original format
+        synthetic_data = pd.DataFrame(scaler.inverse_transform(X_resampled), columns=X_final.columns)
+        synthetic_data[target] = y_resampled  # Assign generated labels
+
+        # Print class distribution after ADASYN
+        print("Class distribution after ADASYN:")
+        print(pd.Series(y_resampled).value_counts())
+
         print("Synthetic data generation applied:")
-        print(synthetic_data[sensitive_attrs].value_counts())
+        print(f"Original dataset shape: {self.dataset.shape}")
+        print(f"Mitigated dataset shape: {synthetic_data.shape}")  # Confirm size change
+
         return synthetic_data
+
+
+
     
     def _identify_sensitive_attributes(self):
         """Identify potential sensitive attributes in dataset"""
